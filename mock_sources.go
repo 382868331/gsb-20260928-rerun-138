@@ -4,9 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -22,6 +26,7 @@ type EntityMapSource struct {
 	kind      string
 	entities  map[string]Entity
 	snapshots map[string][]Record
+	store     SnapshotStore
 }
 
 func NewEntityMapSource(sourceID, kind string, entities []Entity) *EntityMapSource {
@@ -39,6 +44,14 @@ func NewEntityMapSource(sourceID, kind string, entities []Entity) *EntityMapSour
 
 func (s *EntityMapSource) SourceID() string { return s.sourceID }
 
+// UseSnapshotStore enables durable snapshot persistence so a scan can resume
+// with an old cursor after this process exits and all objects are rebuilt.
+func (s *EntityMapSource) UseSnapshotStore(store SnapshotStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store = store
+}
+
 func (s *EntityMapSource) Upsert(entity Entity) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -55,9 +68,9 @@ func (s *EntityMapSource) OpenSnapshot(_ context.Context, resume Cursor) (Snapsh
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if resume.Token != "" || resume.SnapshotID != "" {
-		records, ok := s.snapshots[resume.SnapshotID]
-		if !ok {
-			return nil, fmt.Errorf("source %q snapshot %q is no longer available", s.sourceID, resume.SnapshotID)
+		records, err := s.loadSnapshotLocked(resume)
+		if err != nil {
+			return nil, err
 		}
 		return &pageSnapshot{id: resume.SnapshotID, records: records}, nil
 	}
@@ -77,15 +90,39 @@ func (s *EntityMapSource) OpenSnapshot(_ context.Context, resume Cursor) (Snapsh
 	}
 	id := randomSnapshotID(s.sourceID)
 	s.snapshots[id] = records
+	if err := s.store.Save(s.sourceID, id, records); err != nil {
+		return nil, err
+	}
 	return &pageSnapshot{id: id, records: records}, nil
+}
+
+func (s *EntityMapSource) loadSnapshotLocked(resume Cursor) ([]Record, error) {
+	if records, ok := s.snapshots[resume.SnapshotID]; ok {
+		return records, nil
+	}
+	records, err := s.store.Load(s.sourceID, resume.SnapshotID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, &SnapshotExpiredError{
+				SourceID:       s.sourceID,
+				SnapshotID:     resume.SnapshotID,
+				CompletedToken: resume.Token,
+			}
+		}
+		return nil, err
+	}
+	s.snapshots[resume.SnapshotID] = records
+	return records, nil
 }
 
 type AppendLogSource struct {
 	mu        sync.Mutex
 	sourceID  string
 	kind      string
+	dataFile  string
 	records   []Record
 	snapshots map[string][]Record
+	store     SnapshotStore
 }
 
 func NewAppendLogSource(sourceID, kind string) *AppendLogSource {
@@ -94,6 +131,22 @@ func NewAppendLogSource(sourceID, kind string) *AppendLogSource {
 
 func (s *AppendLogSource) SourceID() string { return s.sourceID }
 
+// UseDataFile backs the log with a durable file so appended records survive a
+// real process exit; a rebuilt source object reads them back on the next scan.
+func (s *AppendLogSource) UseDataFile(path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dataFile = path
+}
+
+// UseSnapshotStore enables durable snapshot persistence so a scan can resume
+// with an old cursor after this process exits and all objects are rebuilt.
+func (s *AppendLogSource) UseSnapshotStore(store SnapshotStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.store = store
+}
+
 func (s *AppendLogSource) Append(id, version string, payload any) error {
 	record, err := NewRecord(s.sourceID, s.kind, id, version, payload)
 	if err != nil {
@@ -101,6 +154,27 @@ func (s *AppendLogSource) Append(id, version string, payload any) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.dataFile != "" {
+		line, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		f, err := os.OpenFile(s.dataFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return err
+		}
+		if _, err := f.Write(append(line, '\n')); err != nil {
+			_ = f.Close()
+			return err
+		}
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			return err
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+	}
 	s.records = append(s.records, record)
 	return nil
 }
@@ -109,16 +183,68 @@ func (s *AppendLogSource) OpenSnapshot(_ context.Context, resume Cursor) (Snapsh
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if resume.Token != "" || resume.SnapshotID != "" {
-		records, ok := s.snapshots[resume.SnapshotID]
-		if !ok {
-			return nil, fmt.Errorf("source %q snapshot %q is no longer available", s.sourceID, resume.SnapshotID)
+		records, err := s.loadSnapshotLocked(resume)
+		if err != nil {
+			return nil, err
 		}
 		return &pageSnapshot{id: resume.SnapshotID, records: records}, nil
 	}
 	id := randomSnapshotID(s.sourceID)
 	records := append([]Record(nil), s.records...)
+	if s.dataFile != "" {
+		loaded, err := readRecordLines(s.dataFile)
+		if err != nil {
+			return nil, err
+		}
+		records = loaded
+		s.records = append([]Record(nil), loaded...)
+	}
 	s.snapshots[id] = records
+	if err := s.store.Save(s.sourceID, id, records); err != nil {
+		return nil, err
+	}
 	return &pageSnapshot{id: id, records: records}, nil
+}
+
+func readRecordLines(path string) ([]Record, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var records []Record
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		var record Record
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			return nil, fmt.Errorf("append log %q is corrupted: %w", path, err)
+		}
+		records = append(records, record)
+	}
+	return records, nil
+}
+
+func (s *AppendLogSource) loadSnapshotLocked(resume Cursor) ([]Record, error) {
+	if records, ok := s.snapshots[resume.SnapshotID]; ok {
+		return records, nil
+	}
+	records, err := s.store.Load(s.sourceID, resume.SnapshotID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, &SnapshotExpiredError{
+				SourceID:       s.sourceID,
+				SnapshotID:     resume.SnapshotID,
+				CompletedToken: resume.Token,
+			}
+		}
+		return nil, err
+	}
+	s.snapshots[resume.SnapshotID] = records
+	return records, nil
 }
 
 type pageSnapshot struct {

@@ -141,6 +141,169 @@ func (s *failOnceAfterWriteSink) WriteBatch(ctx context.Context, batch Batch) er
 	return nil
 }
 
+func TestRunnerResumeAfterFullProcessRestart(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+	checkpointFile := filepath.Join(t.TempDir(), "checkpoint.json")
+	snapshotDir := t.TempDir()
+	logFile := filepath.Join(t.TempDir(), "events.log")
+	store := FileCheckpointStore{Path: checkpointFile}
+
+	newEntitySource := func() *EntityMapSource {
+		source := NewEntityMapSource("entities", "user", []Entity{
+			{ID: "a", Version: "v1", Payload: map[string]any{"n": 1}},
+			{ID: "b", Version: "v1", Payload: map[string]any{"n": 2}},
+			{ID: "c", Version: "v1", Payload: map[string]any{"n": 3}},
+			{ID: "d", Version: "v1", Payload: map[string]any{"n": 4}},
+			{ID: "e", Version: "v1", Payload: map[string]any{"n": 5}},
+		})
+		source.UseSnapshotStore(SnapshotStore{Dir: snapshotDir})
+		return source
+	}
+	newLogSource := func() *AppendLogSource {
+		source := NewAppendLogSource("events", "event")
+		source.UseSnapshotStore(SnapshotStore{Dir: snapshotDir})
+		source.UseDataFile(logFile)
+		return source
+	}
+
+	entitySource := newEntitySource()
+	logSource := newLogSource()
+	for i := 0; i < 4; i++ {
+		if err := logSource.Append(string(rune('a'+i)), "v1", map[string]any{"i": i}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	crash := &failOnceAfterWriteSink{next: FileSink{Dir: outputDir}, failAfterWrites: 2, err: errors.New("simulated crash")}
+	runner := Runner{Connectors: []Connector{entitySource, logSource}, Checkpoints: store, Sink: crash, PageSize: 2}
+	if err := runner.Run(ctx); !errors.Is(err, crash.err) {
+		t.Fatalf("first run error = %v, want simulated crash", err)
+	}
+
+	// Simulate a real process exit: every object is discarded and rebuilt.
+	// The source data changes before the restart; the interrupted scan must
+	// still finish the original snapshot instead of switching to live data.
+	entitySource = newEntitySource()
+	logSource = newLogSource()
+	entitySource.Delete("b")
+	entitySource.Upsert(Entity{ID: "a", Version: "v2", Payload: map[string]any{"n": 99}})
+	entitySource.Upsert(Entity{ID: "f", Version: "v1", Payload: map[string]any{"n": 6}})
+	for i := 4; i < 6; i++ {
+		if err := logSource.Append(string(rune('a'+i)), "v1", map[string]any{"i": i}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	crash2 := &failOnceAfterWriteSink{next: FileSink{Dir: outputDir}, failAfterWrites: 4, err: errors.New("second crash")}
+	runner = Runner{Connectors: []Connector{entitySource, logSource}, Checkpoints: store, Sink: crash2, PageSize: 2}
+	if err := runner.Run(ctx); !errors.Is(err, crash2.err) {
+		t.Fatalf("second run error = %v, want simulated crash", err)
+	}
+
+	// Third process lifetime: rebuild everything again and finish the scan.
+	entitySource = newEntitySource()
+	logSource = newLogSource()
+	runner = Runner{
+		Connectors:  []Connector{entitySource, logSource},
+		Checkpoints: store,
+		Sink:        FileSink{Dir: outputDir},
+		PageSize:    2,
+	}
+	if err := runner.Run(ctx); err != nil {
+		t.Fatalf("final resume run = %v", err)
+	}
+
+	records := readOutputRecords(t, outputDir)
+	want := []string{
+		"events/a", "events/b", "events/c", "events/d", "events/e", "events/f",
+		"entities/a", "entities/b", "entities/c", "entities/d", "entities/e",
+	}
+	assertQualifiedIDs(t, records, want)
+	for _, record := range records {
+		if record.Identity.Source == "entities" && record.Identity.Version != "v1" {
+			t.Fatalf("record %s has version %q, want the snapshot version v1",
+				record.Identity.ExternalID, record.Identity.Version)
+		}
+	}
+	cursors, err := store.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for sourceID, cursor := range cursors {
+		if !cursor.Complete {
+			t.Fatalf("source %s checkpoint = %+v, want complete", sourceID, cursor)
+		}
+	}
+}
+
+func TestSnapshotExpiredReportsRecoverableScope(t *testing.T) {
+	ctx := context.Background()
+	outputDir := t.TempDir()
+	checkpointFile := filepath.Join(t.TempDir(), "checkpoint.json")
+	snapshotDir := t.TempDir()
+	store := FileCheckpointStore{Path: checkpointFile}
+
+	newEntitySource := func() *EntityMapSource {
+		source := NewEntityMapSource("entities", "user", []Entity{
+			{ID: "a", Version: "v1", Payload: map[string]any{"n": 1}},
+			{ID: "b", Version: "v1", Payload: map[string]any{"n": 2}},
+			{ID: "c", Version: "v1", Payload: map[string]any{"n": 3}},
+			{ID: "d", Version: "v1", Payload: map[string]any{"n": 4}},
+			{ID: "e", Version: "v1", Payload: map[string]any{"n": 5}},
+		})
+		source.UseSnapshotStore(SnapshotStore{Dir: snapshotDir})
+		return source
+	}
+
+	crash := &failOnceAfterWriteSink{next: FileSink{Dir: outputDir}, failAfterWrites: 2, err: errors.New("simulated crash")}
+	runner := Runner{Connectors: []Connector{newEntitySource()}, Checkpoints: store, Sink: crash, PageSize: 2}
+	if err := runner.Run(ctx); !errors.Is(err, crash.err) {
+		t.Fatalf("first run error = %v, want simulated crash", err)
+	}
+	cursors, err := store.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor := cursors["entities"]
+	if cursor.Complete || cursor.Token != "2" || cursor.SnapshotID == "" {
+		t.Fatalf("checkpoint = %+v, want mid-scan cursor at token 2", cursor)
+	}
+
+	// The snapshot truly expires (durable copy lost) before the restart.
+	if err := os.RemoveAll(snapshotDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	runner = Runner{
+		Connectors:  []Connector{newEntitySource()},
+		Checkpoints: store,
+		Sink:        FileSink{Dir: outputDir},
+		PageSize:    2,
+	}
+	err = runner.Run(ctx)
+	if !IsSnapshotExpired(err) {
+		t.Fatalf("resume error = %v, want SnapshotExpiredError", err)
+	}
+	var expired *SnapshotExpiredError
+	if !errors.As(err, &expired) {
+		t.Fatalf("errors.As failed for %v", err)
+	}
+	if expired.SourceID != "entities" || expired.SnapshotID != cursor.SnapshotID || expired.CompletedToken != "2" {
+		t.Fatalf("expired error = %+v, want source entities, snapshot %q, token 2",
+			expired, cursor.SnapshotID)
+	}
+
+	// The remaining records must not be silently skipped or emitted from a
+	// fresh scan masquerading as the old one: only the pre-crash batches exist
+	// and record e of the lost snapshot is never emitted.
+	records := readOutputRecords(t, outputDir)
+	assertQualifiedIDs(t, records, []string{"entities/a", "entities/b", "entities/c", "entities/d"})
+}
+
 func assertIDs(t *testing.T, records []Record, want []string) {
 	t.Helper()
 	got := make([]string, len(records))
