@@ -4,7 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
@@ -16,12 +20,102 @@ type Entity struct {
 	Payload map[string]any `json:"payload"`
 }
 
+// SnapshotUnavailableError is returned when a checkpoint references a snapshot
+// that no longer exists in memory or in the durable snapshot store. The scan
+// cannot be silently continued on newer data: batches already written up to
+// Token remain valid, but the remaining records of that snapshot are
+// unrecoverable. To make progress, clear the checkpoint for this source and
+// restart a full scan from a fresh snapshot.
+type SnapshotUnavailableError struct {
+	SourceID   string
+	SnapshotID string
+	Token      string
+}
+
+func (e *SnapshotUnavailableError) Error() string {
+	return fmt.Sprintf(
+		"source %q: snapshot %q is no longer available; output up to cursor token %q is valid, but the remaining records of that snapshot cannot be recovered; clear this source's checkpoint to restart a full scan",
+		e.SourceID, e.SnapshotID, e.Token)
+}
+
+func snapshotUnavailable(sourceID string, resume Cursor) error {
+	return &SnapshotUnavailableError{
+		SourceID:   sourceID,
+		SnapshotID: resume.SnapshotID,
+		Token:      resume.Token,
+	}
+}
+
+// snapshotStore persists snapshot record sets so a scan can resume after the
+// process exits and every object is rebuilt. An empty dir disables durability
+// and falls back to process-memory snapshots only.
+type snapshotStore struct {
+	dir string
+}
+
+func (s snapshotStore) path(id string) string {
+	return filepath.Join(s.dir, "snapshot-"+id+".json")
+}
+
+func (s snapshotStore) save(id string, records []Record) error {
+	if s.dir == "" {
+		return nil
+	}
+	if err := os.MkdirAll(s.dir, 0o755); err != nil {
+		return err
+	}
+	data, err := json.Marshal(records)
+	if err != nil {
+		return err
+	}
+	data = append(data, 10)
+	tmp, err := os.CreateTemp(s.dir, ".snapshot-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, s.path(id))
+}
+
+func (s snapshotStore) load(id string) ([]Record, bool, error) {
+	if s.dir == "" {
+		return nil, false, nil
+	}
+	data, err := os.ReadFile(s.path(id))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var records []Record
+	if err := json.Unmarshal(data, &records); err != nil {
+		return nil, false, fmt.Errorf("snapshot %q is corrupted: %w", id, err)
+	}
+	return records, true, nil
+}
+
 type EntityMapSource struct {
 	mu        sync.Mutex
 	sourceID  string
 	kind      string
 	entities  map[string]Entity
 	snapshots map[string][]Record
+	// SnapshotDir, when set, durably stores snapshots so a scan resumes after
+	// the process exits and all objects are rebuilt with the same directory.
+	SnapshotDir string
 }
 
 func NewEntityMapSource(sourceID, kind string, entities []Entity) *EntityMapSource {
@@ -57,7 +151,15 @@ func (s *EntityMapSource) OpenSnapshot(_ context.Context, resume Cursor) (Snapsh
 	if resume.Token != "" || resume.SnapshotID != "" {
 		records, ok := s.snapshots[resume.SnapshotID]
 		if !ok {
-			return nil, fmt.Errorf("source %q snapshot %q is no longer available", s.sourceID, resume.SnapshotID)
+			loaded, found, err := (snapshotStore{dir: s.SnapshotDir}).load(resume.SnapshotID)
+			if err != nil {
+				return nil, err
+			}
+			if !found {
+				return nil, snapshotUnavailable(s.sourceID, resume)
+			}
+			records = loaded
+			s.snapshots[resume.SnapshotID] = records
 		}
 		return &pageSnapshot{id: resume.SnapshotID, records: records}, nil
 	}
@@ -76,6 +178,9 @@ func (s *EntityMapSource) OpenSnapshot(_ context.Context, resume Cursor) (Snapsh
 		records = append(records, record)
 	}
 	id := randomSnapshotID(s.sourceID)
+	if err := (snapshotStore{dir: s.SnapshotDir}).save(id, records); err != nil {
+		return nil, err
+	}
 	s.snapshots[id] = records
 	return &pageSnapshot{id: id, records: records}, nil
 }
@@ -86,6 +191,9 @@ type AppendLogSource struct {
 	kind      string
 	records   []Record
 	snapshots map[string][]Record
+	// SnapshotDir, when set, durably stores snapshots so a scan resumes after
+	// the process exits and all objects are rebuilt with the same directory.
+	SnapshotDir string
 }
 
 func NewAppendLogSource(sourceID, kind string) *AppendLogSource {
@@ -111,12 +219,23 @@ func (s *AppendLogSource) OpenSnapshot(_ context.Context, resume Cursor) (Snapsh
 	if resume.Token != "" || resume.SnapshotID != "" {
 		records, ok := s.snapshots[resume.SnapshotID]
 		if !ok {
-			return nil, fmt.Errorf("source %q snapshot %q is no longer available", s.sourceID, resume.SnapshotID)
+			loaded, found, err := (snapshotStore{dir: s.SnapshotDir}).load(resume.SnapshotID)
+			if err != nil {
+				return nil, err
+			}
+			if !found {
+				return nil, snapshotUnavailable(s.sourceID, resume)
+			}
+			records = loaded
+			s.snapshots[resume.SnapshotID] = records
 		}
 		return &pageSnapshot{id: resume.SnapshotID, records: records}, nil
 	}
 	id := randomSnapshotID(s.sourceID)
 	records := append([]Record(nil), s.records...)
+	if err := (snapshotStore{dir: s.SnapshotDir}).save(id, records); err != nil {
+		return nil, err
+	}
 	s.snapshots[id] = records
 	return &pageSnapshot{id: id, records: records}, nil
 }
