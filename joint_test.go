@@ -346,3 +346,173 @@ func TestJointMaterialRejectsStaleScope(t *testing.T) {
 		t.Fatal("VerifyJointRecords accepted an incomplete plan")
 	}
 }
+
+// TestJointRescopeAfterPauseReadsNewScopeFromScratch drives the regression
+// where a slow source pauses after its first batch, its old observation
+// scope expires while paused, and the resumed run re-selects a fresh scope.
+// The new candidate must read the new scope from its own start: the old
+// scope's offset and already-read prefix must not substitute for the new
+// scope's reads. The run pauses a second time inside the new scope, then a
+// full save/reopen finishes the plan, and the joint material must contain
+// every record of the new scope exactly once.
+func TestJointRescopeAfterPauseReadsNewScopeFromScratch(t *testing.T) {
+	outputDir := t.TempDir()
+	snapshotRoot := t.TempDir()
+	stateDir := t.TempDir()
+	checkpointPath := filepath.Join(stateDir, "checkpoint.json")
+	planStore := FileJointPlanStore{Dir: stateDir}
+
+	// Phase 1: fast and volatile finish; the slow source is paused after its
+	// first page (records a,b of six).
+	runCtx, cancel := context.WithCancel(context.Background())
+	fast, volatile, slow := buildJointSources(t, snapshotRoot)
+	slowPause := &pausingConnector{Connector: slow, cancel: cancel, readsLeft: 1}
+	runner := JointRunner{
+		PlanID:      "export-rescope",
+		Connectors:  []Connector{fast, volatile, slowPause},
+		Plans:       planStore,
+		Checkpoints: FileCheckpointStore{Path: checkpointPath},
+		Sink:        FileSink{Dir: outputDir},
+		PageSize:    2,
+	}
+	plan, err := runner.Run(runCtx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("paused run error = %v, want context.Canceled", err)
+	}
+	if plan.Scope("slow-log").Complete {
+		t.Fatal("slow scope should be incomplete after the pause")
+	}
+	oldSlowSnapshotID := plan.Scope("slow-log").SnapshotID
+
+	// While paused, the slow source's old observation scope expires.
+	if err := os.RemoveAll(slow.SnapshotDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Phase 2: rebuild everything from disk and resume. The slow source's
+	// expired scope is re-selected under a new candidate, then the source is
+	// paused again after one page of the new scope.
+	runCtx2, cancel2 := context.WithCancel(context.Background())
+	fast2, volatile2, slow2 := buildJointSources(t, snapshotRoot)
+	fastCount := &countingConnector{Connector: fast2}
+	volatileCount := &countingConnector{Connector: volatile2}
+	slowPause2 := &pausingConnector{Connector: slow2, cancel: cancel2, readsLeft: 1}
+	resumed := JointRunner{
+		PlanID:      "export-rescope",
+		Connectors:  []Connector{fastCount, volatileCount, slowPause2},
+		Plans:       planStore,
+		Checkpoints: FileCheckpointStore{Path: checkpointPath},
+		Sink:        FileSink{Dir: outputDir},
+		PageSize:    2,
+	}
+	plan, err = resumed.Run(runCtx2)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("second paused run error = %v, want context.Canceled", err)
+	}
+	if plan.Generation != 2 {
+		t.Fatalf("generation = %d, want 2 after re-scoping the slow source", plan.Generation)
+	}
+	newSlowSnapshotID := plan.Scope("slow-log").SnapshotID
+	if newSlowSnapshotID == "" || newSlowSnapshotID == oldSlowSnapshotID {
+		t.Fatalf("slow scope snapshot = %q, want a fresh scope replacing %q", newSlowSnapshotID, oldSlowSnapshotID)
+	}
+	if plan.Scope("slow-log").Candidate != "export-rescope-g2" {
+		t.Fatalf("slow candidate = %q, want export-rescope-g2", plan.Scope("slow-log").Candidate)
+	}
+	// The re-selected scope restarted from its own beginning: the first page
+	// of the new scope was read before the second pause.
+	if plan.Scope("slow-log").Complete {
+		t.Fatal("slow scope should still be incomplete after the second pause")
+	}
+
+	// The confirmed scopes of the other sources were reused, not recomputed.
+	if fastCount.opens != 1 || fastCount.reads != 0 {
+		t.Fatalf("fast source opens=%d reads=%d, want 1 validation open and 0 reads", fastCount.opens, fastCount.reads)
+	}
+	if volatileCount.opens != 1 || volatileCount.reads != 0 {
+		t.Fatalf("volatile source opens=%d reads=%d, want 1 validation open and 0 reads", volatileCount.opens, volatileCount.reads)
+	}
+
+	// The second cancellation must state exactly what stays reusable.
+	cursors, err := FileCheckpointStore{Path: checkpointPath}.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reusable := map[string]ReusablePart{}
+	for _, part := range plan.ReusableParts(cursors) {
+		reusable[part.SourceID] = part
+	}
+	if reusable["fast-entities"].State != "complete" || reusable["volatile-entities"].State != "complete" {
+		t.Fatalf("finished sources must be reusable as complete, got %+v", reusable)
+	}
+	if reusable["slow-log"].State != "resumable" ||
+		reusable["slow-log"].Token != "2" ||
+		reusable["slow-log"].SnapshotID != newSlowSnapshotID {
+		t.Fatalf("slow part = %+v, want resumable at token 2 of the new scope %q", reusable["slow-log"], newSlowSnapshotID)
+	}
+
+	// Phase 3: save/reopen once more and finish the plan.
+	fast3, volatile3, slow3 := buildJointSources(t, snapshotRoot)
+	finisher := JointRunner{
+		PlanID:      "export-rescope",
+		Connectors:  []Connector{fast3, volatile3, slow3},
+		Plans:       planStore,
+		Checkpoints: FileCheckpointStore{Path: checkpointPath},
+		Sink:        FileSink{Dir: outputDir},
+		PageSize:    2,
+	}
+	plan, err = finisher.Run(context.Background())
+	if err != nil {
+		t.Fatalf("finishing run = %v", err)
+	}
+	if !plan.Complete {
+		t.Fatalf("plan should be complete, got %+v", plan)
+	}
+	if got := plan.Scope("slow-log").SnapshotID; got != newSlowSnapshotID {
+		t.Fatalf("slow scope = %q, want the re-selected scope %q", got, newSlowSnapshotID)
+	}
+	if plan.Scope("fast-entities").Candidate != "export-rescope-g1" ||
+		plan.Scope("volatile-entities").Candidate != "export-rescope-g1" {
+		t.Fatalf("untouched scopes must keep candidate g1, got %+v", plan.Scopes)
+	}
+
+	// The joint material of the finished plan must contain every record of
+	// the slow source's new scope exactly once, including the prefix the old
+	// scope had already read before expiring.
+	batches := readOutputBatches(t, outputDir)
+	material := JointMaterial(plan, batches)
+	if err := VerifyJointRecords(plan, material); err != nil {
+		t.Fatalf("VerifyJointRecords = %v", err)
+	}
+	slowIDs := map[string]int{}
+	for _, batch := range material {
+		if batch.SourceID != "slow-log" {
+			continue
+		}
+		if batch.Candidate != "export-rescope-g2" || batch.Snapshot != newSlowSnapshotID {
+			t.Fatalf("slow batch %q names candidate %q snapshot %q, want g2 scope %q",
+				batch.BatchID, batch.Candidate, batch.Snapshot, newSlowSnapshotID)
+		}
+		for _, record := range batch.Records {
+			if record.Identity.Source != "slow-log" {
+				t.Fatalf("record %q claims source %q", record.DataID, record.Identity.Source)
+			}
+			slowIDs[record.Identity.ExternalID]++
+		}
+	}
+	for _, id := range []string{"a", "b", "c", "d", "e", "f"} {
+		if slowIDs[id] != 1 {
+			t.Fatalf("slow record %q appears %d times in joint material, want 1", id, slowIDs[id])
+		}
+	}
+
+	// The expired scope's old batch stays on disk for audit but is not part
+	// of the joint material.
+	counts := countBatchesBySource(batches)
+	if counts["slow-log"] != 4 {
+		t.Fatalf("slow batch count on disk = %d, want 4 (1 stale + 3 current)", counts["slow-log"])
+	}
+	if got := countBatchesBySource(material)["slow-log"]; got != 3 {
+		t.Fatalf("slow batches in joint material = %d, want 3", got)
+	}
+}

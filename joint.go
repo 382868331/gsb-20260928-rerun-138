@@ -288,6 +288,10 @@ func (r JointRunner) Run(ctx context.Context) (*JointPlan, error) {
 			if err := rescope(scope, connector.SourceID(), unavailable); err != nil {
 				return plan, err
 			}
+			// The re-selected scope must prove completeness on its own:
+			// the expired scope's offset and already-read prefix belong to
+			// the old candidate and must not carry over into the new one.
+			cursor = cursors[key]
 			snapshot, err = connector.OpenSnapshot(ctx, cursors[key])
 			if err != nil {
 				return plan, err
