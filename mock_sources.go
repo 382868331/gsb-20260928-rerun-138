@@ -248,6 +248,9 @@ type pageSnapshot struct {
 func (s *pageSnapshot) ID() string { return s.id }
 
 func (s *pageSnapshot) Read(_ context.Context, cursor Cursor, limit int) (Page, error) {
+	if cursor.SnapshotID != "" && cursor.SnapshotID != s.id {
+		return Page{}, fmt.Errorf("cursor belongs to snapshot %q, cannot read it from snapshot %q; an offset is valid only inside its own observation scope", cursor.SnapshotID, s.id)
+	}
 	offset := 0
 	if cursor.Token != "" {
 		var err error
