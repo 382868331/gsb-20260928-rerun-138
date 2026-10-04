@@ -67,6 +67,13 @@ func shortID(value string, length int) string {
 func deterministicBatchID(batch Batch) string {
 	h := sha256.New()
 	_, _ = fmt.Fprintf(h, "batch\x00%s\x00%s\x00%d\n", batch.SourceID, batch.StartToken, len(batch.Records))
+	if batch.PlanID != "" {
+		// Joint export batches are scoped to one plan candidate and
+		// observation snapshot, so re-selecting a source's scope under a
+		// new candidate never collides with the confirmed old material,
+		// even when the record contents are identical.
+		_, _ = fmt.Fprintf(h, "joint\x00%s\x00%s\x00%s\n", batch.PlanID, batch.Candidate, batch.Snapshot)
+	}
 	for _, record := range batch.Records {
 		_, _ = fmt.Fprintf(h, "%s\n", record.DataID)
 	}

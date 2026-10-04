@@ -87,6 +87,11 @@ type Batch struct {
 	Snapshot   string   `json:"snapshot_id"`
 	StartToken string   `json:"start_token"`
 	Records    []Record `json:"records"`
+	// PlanID and Candidate are set by JointRunner so every batch is
+	// attributable to one joint export candidate. Plain Runner leaves
+	// them empty.
+	PlanID    string `json:"plan_id,omitempty"`
+	Candidate string `json:"candidate,omitempty"`
 }
 
 type Sink interface {
