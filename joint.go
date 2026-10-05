@@ -23,6 +23,11 @@ type JointScope struct {
 	Candidate  string `json:"candidate"`
 	SnapshotID string `json:"snapshot_id"`
 	Complete   bool   `json:"complete"`
+	// ReSelected is set when this scope's previous observation range
+	// expired and the source alone was re-selected under a new joint
+	// candidate. Delivery reviews use it to tell re-fetched scopes apart
+	// from scopes that reused previously confirmed results.
+	ReSelected bool `json:"reselected,omitempty"`
 }
 
 // JointPlan is the durable state of a joint export across independent
@@ -253,6 +258,7 @@ func (r JointRunner) Run(ctx context.Context) (*JointPlan, error) {
 		scope.Complete = false
 		scope.Candidate = candidate
 		scope.SnapshotID = ""
+		scope.ReSelected = true
 		return savePlan()
 	}
 	for _, connector := range r.Connectors {
