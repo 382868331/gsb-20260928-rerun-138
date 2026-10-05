@@ -23,7 +23,22 @@ type JointScope struct {
 	Candidate  string `json:"candidate"`
 	SnapshotID string `json:"snapshot_id"`
 	Complete   bool   `json:"complete"`
+	// Origin records how this scope's material entered the current joint
+	// candidate: "fresh" (read in full during the latest run), "reused"
+	// (confirmed earlier and only validated), or "rescoped" (the previous
+	// observation scope expired and the source alone was re-selected).
+	// OriginReason keeps the human-readable explanation next to it so a
+	// saved plan still explains itself after a reopen.
+	Origin       string `json:"origin,omitempty"`
+	OriginReason string `json:"origin_reason,omitempty"`
 }
+
+// Scope origins reported in a delivery review.
+const (
+	ScopeOriginFresh    = "fresh"
+	ScopeOriginReused   = "reused"
+	ScopeOriginRescoped = "rescoped"
+)
 
 // JointPlan is the durable state of a joint export across independent
 // sources. It is complete only when every required source scope is complete.
@@ -253,6 +268,10 @@ func (r JointRunner) Run(ctx context.Context) (*JointPlan, error) {
 		scope.Complete = false
 		scope.Candidate = candidate
 		scope.SnapshotID = ""
+		scope.Origin = ScopeOriginRescoped
+		scope.OriginReason = fmt.Sprintf(
+			"observation scope %q expired at cursor token %q; the source was re-selected alone under new joint candidate %q and read again from its own start",
+			unavailable.SnapshotID, unavailable.Token, candidate)
 		return savePlan()
 	}
 	for _, connector := range r.Connectors {
@@ -265,6 +284,13 @@ func (r JointRunner) Run(ctx context.Context) (*JointPlan, error) {
 			// nothing. If the scope expired, this source alone is re-selected.
 			snapshot, err := connector.OpenSnapshot(ctx, cursor)
 			if err == nil {
+				scope.Origin = ScopeOriginReused
+				scope.OriginReason = fmt.Sprintf(
+					"scope was confirmed earlier under candidate %q and its pinned snapshot %q is still available; the confirmed result is reused without re-reading any records",
+					scope.Candidate, scope.SnapshotID)
+				if err := savePlan(); err != nil {
+					return plan, err
+				}
 				if err := snapshot.Close(); err != nil {
 					return plan, err
 				}
@@ -348,6 +374,12 @@ func (r JointRunner) Run(ctx context.Context) (*JointPlan, error) {
 			return plan, err
 		}
 		scope.Complete = true
+		if scope.Origin != ScopeOriginRescoped {
+			scope.Origin = ScopeOriginFresh
+			scope.OriginReason = fmt.Sprintf(
+				"read in full from observation scope %q during this run",
+				scope.SnapshotID)
+		}
 		if err := savePlan(); err != nil {
 			return plan, err
 		}
